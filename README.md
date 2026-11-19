@@ -22,8 +22,8 @@ apk-alignment-checker -markdown report.md app.apk  # Markdownのレポートも�
 
 ```
 ✘ FAIL  internal/checker/testdata/libdatastore_shared_counter.so
-        ABI: arm64-v8a | LOAD align: 2**14 | GNU_RELRO: end 0xd000 (unaligned) | ZIP: n/a
-        → GNU_RELRO: end 0xd000 is not 16KB aligned, mprotect(PROT_READ) extends to 0x10000
+        ABI: arm64-v8a | LOAD align: 2**14 | GNU_RELRO: 0xc000-0xd000 (unaligned) | ZIP: n/a
+        → GNU_RELRO: end 0xd000 is neither 16KB aligned nor the end of its LOAD segment, mprotect(PROT_READ) extends to 0x10000
 ```
 
 `.apk` `.aab` `.apks` `.so`と、それらを含むディレクトリを検査できます。
@@ -64,8 +64,8 @@ Composite Actionとして呼び出すことで、GitHub Actionsでチェック�
 | --- | --- | --- |
 | LOAD alignment | すべての`PT_LOAD`の`p_align`が16KB (2\*\*14)以上の2の冪である | 4KB境界のセグメントは16KBページではmmapできない |
 | LOAD offset | `p_offset ≡ p_vaddr (mod 16KB)` | `p_align`だけ書き換えたライブラリはロードできない |
-| GNU_RELRO | 終端(`p_vaddr + p_memsz`)が16KB境界、またはRELROが同じアドレスから始まる`PT_LOAD`全体を覆っている | bionic linkerはRELROを`page_end(終端)`までmprotectするため、終端がアラインされていないと後続のRWデータまで読み取り専用になりうる([linker_phdr.cpp](https://android.googlesource.com/platform/bionic/+/refs/heads/main/linker/linker_phdr.cpp)の`_extend_gnu_relro_prot_end`)。RWデータと重ならない場合も弾く |
-| ZIP alignment | APKの`lib/`以下に非圧縮で格納された`.so`のデータオフセットが16KBにアラインされている(`zipalign -P 16`相当) | 非圧縮のライブラリはAPKから直接mmapされる。圧縮されている場合はインストール時に展開されるので対象外。AABはbundletoolがAPK生成時にアラインするので対象外 |
+| GNU_RELRO | RELROと、それを含む`PT_LOAD`に含まれるセクションが同じ。または以下をすべて満たす<br>・次の`PT_LOAD`にはみ出していない<br>・始点が16KB境界か、`PT_LOAD`の先頭<br>・終点(`p_vaddr + p_memsz`)が16KB境界か、`PT_LOAD`の終端 | bionic linkerはRELROを`page_start(始点)`から`page_end(終点)`までmprotectするため、16KB境界にないと隣のRWデータまで読み取り専用になりうる |
+| ZIP alignment | 非圧縮で格納されたELFのデータオフセットが16KBにアラインされている(`zipalign -P 16`相当)。パスやAPK/AABに関係なく、マジックナンバーでELFと判定したものすべてが対象 | 非圧縮のライブラリはAPKから直接mmapされる。圧縮されている場合はインストール時に展開されるので対象外 |
 
 ## 参考資料
 

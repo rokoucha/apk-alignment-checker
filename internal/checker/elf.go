@@ -1,10 +1,13 @@
 package checker
 
 import (
+	"cmp"
 	"debug/elf"
 	"fmt"
 	"io"
+	"math"
 	"math/bits"
+	"slices"
 )
 
 const PageSize = 16 * 1024
@@ -20,19 +23,20 @@ type Segment struct {
 }
 
 type RelroInfo struct {
+	Start      uint64 `json:"start"`
 	End        uint64 `json:"end"`
-	ProtectEnd uint64 `json:"protectEnd"`
-	Suffix     bool   `json:"suffix"`
+	CoversLoad bool   `json:"coversLoad"`
 	OK         bool   `json:"ok"`
 }
 
 type ELFResult struct {
-	Machine   string      `json:"machine"`
-	Is64Bit   bool        `json:"is64bit"`
-	LoadAlign uint64      `json:"loadAlign"` // PT_LOADセグメントのp_alignの最小値
-	Relro     []RelroInfo `json:"relro,omitempty"`
-	Problems  []string    `json:"problems,omitempty"`
-	Segments  []Segment   `json:"segments,omitempty"`
+	Machine      string      `json:"machine"`
+	Is64Bit      bool        `json:"is64bit"`
+	LittleEndian bool        `json:"littleEndian"`
+	LoadAlign    uint64      `json:"loadAlign"` // PT_LOADセグメントのp_alignの最小値
+	Relro        []RelroInfo `json:"relro,omitempty"`
+	Problems     []string    `json:"problems,omitempty"`
+	Segments     []Segment   `json:"segments,omitempty"`
 }
 
 var abiNames = map[elf.Machine]string{
@@ -50,7 +54,7 @@ func CheckELF(r io.ReaderAt) (*ELFResult, error) {
 	}
 	defer f.Close()
 
-	res := &ELFResult{Machine: f.Machine.String(), Is64Bit: f.Class == elf.ELFCLASS64}
+	res := &ELFResult{Machine: f.Machine.String(), Is64Bit: f.Class == elf.ELFCLASS64, LittleEndian: f.Data == elf.ELFDATA2LSB}
 	if abi, ok := abiNames[f.Machine]; ok {
 		res.Machine = abi
 	}
@@ -97,47 +101,101 @@ func CheckELF(r io.ReaderAt) (*ELFResult, error) {
 		}
 	}
 
-	// 2. bionicはGNU_RELROをpage_end(vaddr+memsz)までmprotectする。16KBページ端末では次の16KB境界まで
-	//    切り上げられるので、終端がアラインされていないと後ろにあるRWデータまで読み取り専用になりうる。
-	//    例外はGNU_RELROが同じアドレスから始まるLOAD全体を覆っている場合(suffix)で、範囲がそのLOADの終端まで広げられるので安全。
-	//    RWデータと重ならない場合もGoogle Playでは警告されるので、終端がアラインされていなければ問題とする。
-	//    https://android.googlesource.com/platform/bionic/+/refs/heads/main/linker/linker_phdr.cpp
+	// 2. GNU_RELROはAndroid StudioのAPK Analyzerと同じ条件で検査する。
+	//    bionicはRELROをpage_start(始点)からpage_end(終点)までmprotectするので、16KBページ端末では
+	//    範囲が16KB境界まで広がり、隣にあるRWデータまで読み取り専用になりうる。
+	sorted := slices.SortedStableFunc(slices.Values(loads), func(a, b *elf.Prog) int { return cmp.Compare(a.Vaddr, b.Vaddr) })
 	for _, relro := range relros {
-		end, carry := bits.Add64(relro.Vaddr, relro.Memsz, 0)
-		if carry != 0 {
-			res.Problems = append(res.Problems, fmt.Sprintf("GNU_RELRO@0x%x: vaddr+memsz overflows", relro.Vaddr))
-			continue
+		info, problems := checkRelro(relro, sorted, f.Sections)
+		if info != nil {
+			res.Relro = append(res.Relro, *info)
 		}
-		info := RelroInfo{End: end, ProtectEnd: (end + PageSize - 1) &^ (PageSize - 1)}
-		for _, p := range loads {
-			if p.Vaddr == relro.Vaddr && relro.Memsz >= p.Memsz {
-				info.Suffix = true
-				break
-			}
-		}
-		info.OK = info.Suffix || end%PageSize == 0
-		res.Relro = append(res.Relro, info)
-		if !info.OK {
-			res.Problems = append(res.Problems, relroProblem(info, loads))
-		}
+		res.Problems = append(res.Problems, problems...)
 	}
 
 	return res, nil
 }
 
-func relroProblem(info RelroInfo, loads []*elf.Prog) string {
-	msg := fmt.Sprintf("GNU_RELRO: end 0x%x is not 16KB aligned, mprotect(PROT_READ) extends to 0x%x", info.End, info.ProtectEnd)
-	// 読み取り専用になってしまう書き込み可能なデータがあれば、その範囲も示す。
+func checkRelro(relro *elf.Prog, loads []*elf.Prog, sections []*elf.Section) (*RelroInfo, []string) {
+	end, carry := bits.Add64(relro.Vaddr, relro.Memsz, 0)
+	if carry != 0 {
+		return nil, []string{fmt.Sprintf("GNU_RELRO@0x%x: vaddr+memsz overflows", relro.Vaddr)}
+	}
+
+	// RELROを含むLOADは、RELROの始点以前から始まる最後のLOAD。
+	i := -1
+	for j, p := range loads {
+		if p.Vaddr <= relro.Vaddr {
+			i = j
+		}
+	}
+	if i == -1 {
+		return nil, []string{fmt.Sprintf("GNU_RELRO@0x%x: not contained in any LOAD segment", relro.Vaddr)}
+	}
+	load := loads[i]
+	loadEnd := segmentEnd(load.Vaddr, load.Memsz)
+	info := &RelroInfo{Start: relro.Vaddr, End: end}
+
+	// RELROが次のLOADにはみ出していないこと。
+	if i+1 < len(loads) && end > loads[i+1].Vaddr {
+		return info, []string{fmt.Sprintf("GNU_RELRO: end 0x%x extends into the next LOAD segment at 0x%x", end, loads[i+1].Vaddr)}
+	}
+
+	// RELROとLOADに含まれるセクションが同じなら、RELROは実質LOAD全体なので問題ない。
+	if slices.Equal(containedSections(sections, relro.Vaddr, end), containedSections(sections, load.Vaddr, loadEnd)) {
+		info.CoversLoad, info.OK = true, true
+		return info, nil
+	}
+
+	var problems []string
+	// 始点は16KB境界か、LOADの先頭であること(prefix)。
+	if relro.Vaddr%PageSize != 0 && relro.Vaddr != load.Vaddr {
+		from := relro.Vaddr &^ (PageSize - 1)
+		problems = append(problems, fmt.Sprintf("GNU_RELRO: start 0x%x is neither 16KB aligned nor the start of its LOAD segment, mprotect(PROT_READ) extends down to 0x%x%s",
+			relro.Vaddr, from, rwOverlap(loads, from, relro.Vaddr)))
+	}
+	// 終点は16KB境界か、LOADの終端であること(suffix)。
+	if end%PageSize != 0 && end != loadEnd {
+		to := segmentEnd(end, PageSize-1) &^ (PageSize - 1)
+		problems = append(problems, fmt.Sprintf("GNU_RELRO: end 0x%x is neither 16KB aligned nor the end of its LOAD segment, mprotect(PROT_READ) extends to 0x%x%s",
+			end, to, rwOverlap(loads, end, to)))
+	}
+	info.OK = len(problems) == 0
+	return info, problems
+}
+
+type sectionRange struct{ addr, size uint64 }
+
+func containedSections(sections []*elf.Section, start, end uint64) []sectionRange {
+	var r []sectionRange
+	for _, s := range sections {
+		if s.Addr >= start && segmentEnd(s.Addr, s.Size) <= end {
+			r = append(r, sectionRange{s.Addr, s.Size})
+		}
+	}
+	slices.SortStableFunc(r, func(a, b sectionRange) int { return cmp.Compare(a.addr, b.addr) })
+	return r
+}
+
+func rwOverlap(loads []*elf.Prog, from, to uint64) string {
 	for _, p := range loads {
 		if p.Flags&elf.PF_W == 0 {
 			continue
 		}
-		from, to := max(p.Vaddr, info.End), min(p.Vaddr+p.Memsz, info.ProtectEnd)
-		if from < to {
-			return msg + fmt.Sprintf(" and makes RW data 0x%x-0x%x read-only", from, to)
+		f, t := max(p.Vaddr, from), min(segmentEnd(p.Vaddr, p.Memsz), to)
+		if f < t {
+			return fmt.Sprintf(" and makes RW data 0x%x-0x%x read-only", f, t)
 		}
 	}
-	return msg
+	return ""
+}
+
+func segmentEnd(addr, size uint64) uint64 {
+	end, carry := bits.Add64(addr, size, 0)
+	if carry != 0 {
+		return math.MaxUint64
+	}
+	return end
 }
 
 func segmentType(t elf.ProgType) string {

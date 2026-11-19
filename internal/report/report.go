@@ -34,8 +34,12 @@ func Text(w io.Writer, results []checker.Result, verbose, color bool) {
 		}
 		fmt.Fprintf(w, "%sABI: %s | LOAD align: %s | GNU_RELRO: %s | ZIP: %s\n", indent,
 			r.Machine, checker.FormatAlign(r.LoadAlign), relroSummary(r.Relro), zipSummary(r.Zip))
-		if r.Status == checker.StatusSkip {
+		switch {
+		case r.Status != checker.StatusSkip:
+		case !r.Is64Bit:
 			fmt.Fprintf(w, "%s%s\n", indent, paint("90", "32-bit library: not required to support 16KB pages"))
+		default:
+			fmt.Fprintf(w, "%s%s\n", indent, paint("90", "big-endian library: not used on Android"))
 		}
 		for _, p := range r.Problems {
 			fmt.Fprintf(w, "%s%s\n", indent, paint("31", "→ "+p))
@@ -139,12 +143,12 @@ func relroSummary(relros []checker.RelroInfo) string {
 	var parts []string
 	for _, r := range relros {
 		switch {
-		case r.Suffix:
-			parts = append(parts, fmt.Sprintf("end 0x%x (covers whole LOAD)", r.End))
+		case r.CoversLoad:
+			parts = append(parts, fmt.Sprintf("0x%x-0x%x (covers whole LOAD)", r.Start, r.End))
 		case r.OK:
-			parts = append(parts, fmt.Sprintf("end 0x%x (aligned)", r.End))
+			parts = append(parts, fmt.Sprintf("0x%x-0x%x (aligned)", r.Start, r.End))
 		default:
-			parts = append(parts, fmt.Sprintf("end 0x%x (unaligned)", r.End))
+			parts = append(parts, fmt.Sprintf("0x%x-0x%x (unaligned)", r.Start, r.End))
 		}
 	}
 	return strings.Join(parts, ", ")

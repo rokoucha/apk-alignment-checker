@@ -3,6 +3,8 @@ package checker
 import (
 	"archive/zip"
 	"bytes"
+	"debug/elf"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -38,8 +40,7 @@ type Result struct {
 type archiveKind int
 
 const (
-	kindAPK  archiveKind = iota // ネイティブライブラリのZIP内のアラインメントも検査する
-	kindAAB                     // APK生成時にbundletoolがアラインするのでZIPは検査しない
+	kindZip  archiveKind = iota // APK/AABなど。中のELFを検査する
 	kindAPKS                    // 中のAPKを検査する
 )
 
@@ -98,12 +99,10 @@ func scanFile(path string) ([]Result, error) {
 
 func kindOf(name string) archiveKind {
 	switch strings.ToLower(filepath.Ext(name)) {
-	case ".aab":
-		return kindAAB
 	case ".apks", ".zip":
 		return kindAPKS
 	}
-	return kindAPK
+	return kindZip
 }
 
 func scanArchive(name string, r io.ReaderAt, size int64, kind archiveKind) ([]Result, error) {
@@ -123,7 +122,7 @@ func scanArchive(name string, r io.ReaderAt, size int64, kind archiveKind) ([]Re
 			if err != nil {
 				return nil, fmt.Errorf("%s: %w", entry, err)
 			}
-			rs, err := scanArchive(entry, bytes.NewReader(data), int64(len(data)), kindAPK)
+			rs, err := scanArchive(entry, bytes.NewReader(data), int64(len(data)), kindZip)
 			if err != nil {
 				return nil, fmt.Errorf("%s: %w", entry, err)
 			}
@@ -131,15 +130,22 @@ func scanArchive(name string, r io.ReaderAt, size int64, kind archiveKind) ([]Re
 			continue
 		}
 
-		if !strings.HasSuffix(lower, ".so") || zf.FileInfo().IsDir() {
+		if zf.FileInfo().IsDir() {
+			continue
+		}
+		// 拡張子ではなくELFのマジックナンバーで判定する。
+		// ただし.soなのにELFとして読めないものは壊れているので、結果に含める。
+		isELF, err := hasELFMagic(zf)
+		if err != nil {
+			// 読めないエントリはELFかどうかも分からないので、検査できなかったことを結果に残す。
+			results = append(results, Result{Path: entry, Status: StatusFail, Error: err.Error()})
+			continue
+		}
+		if !isELF && !strings.HasSuffix(lower, ".so") {
 			continue
 		}
 
-		var zi *ZipInfo
-		// システムがAPKから直接ロードするのはlib/以下のライブラリだけ。
-		if kind == kindAPK && strings.HasPrefix(zf.Name, "lib/") {
-			zi = zipInfo(zf)
-		}
+		zi := zipInfo(zf)
 
 		data, err := readEntry(zf)
 		if err != nil {
@@ -162,6 +168,22 @@ func zipInfo(zf *zip.File) *ZipInfo {
 	return zi
 }
 
+func hasELFMagic(zf *zip.File) (bool, error) {
+	rc, err := zf.Open()
+	if err != nil {
+		return false, err
+	}
+	defer rc.Close()
+	var magic [4]byte
+	if _, err := io.ReadFull(rc, magic[:]); err != nil {
+		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+			return false, nil
+		}
+		return false, err
+	}
+	return string(magic[:]) == elf.ELFMAG, nil
+}
+
 func readEntry(zf *zip.File) ([]byte, error) {
 	rc, err := zf.Open()
 	if err != nil {
@@ -180,6 +202,12 @@ func checkLibrary(path string, r io.ReaderAt, zi *ZipInfo) Result {
 		return res
 	}
 	res.ELFResult = er
+
+	// Androidはリトルエンディアン以外をサポートしてない
+	if !er.LittleEndian {
+		res.Status = StatusSkip
+		return res
+	}
 
 	// Google Playは64ビットのABIにしか16KB対応を求めていないので、他はスキップでよい
 	if !er.Is64Bit {
