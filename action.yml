@@ -1,0 +1,67 @@
+name: APK 16KB page size alignment check
+description: Check that native libraries in APK/AAB/APKS files support Android devices with 16KB page size
+branding:
+  icon: check-circle
+  color: green
+
+inputs:
+  paths:
+    description: Files (.apk, .aab, .apks, .so) or directories to check, separated by whitespace or newlines. Glob patterns are expanded.
+    required: true
+  working-directory:
+    description: Directory that paths are relative to
+    required: false
+    default: .
+
+outputs:
+  report:
+    description: Markdown report of the check, e.g. for PR comments
+    value: ${{ steps.check.outputs.report }}
+
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+      with:
+        go-version-file: ${{ github.action_path }}/go.mod
+        cache: false
+
+    - name: Build apk-alignment-checker
+      shell: bash
+      working-directory: ${{ github.action_path }}
+      run: go build -o "$RUNNER_TEMP/apk-alignment-checker" .
+
+    - name: Check 16KB page size alignment
+      id: check
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        INPUT_PATHS: ${{ inputs.paths }}
+      run: |
+        shopt -s nullglob globstar
+
+        # 空白で分割してglobを展開する。
+        paths=()
+        for p in $INPUT_PATHS; do
+          paths+=("$p")
+        done
+        if [ ${#paths[@]} -eq 0 ]; then
+          echo "::error title=16KB page size::No files matched the paths input"
+          exit 2
+        fi
+
+        report="$RUNNER_TEMP/apk-alignment-report.md"
+        rm -f "$report"
+        code=0
+        "$RUNNER_TEMP/apk-alignment-checker" -markdown "$report" "${paths[@]}" || code=$?
+
+        if [ -f "$report" ]; then
+          delimiter="EOF_$(openssl rand -hex 16)"
+          {
+            echo "report<<$delimiter"
+            cat "$report"
+            echo "$delimiter"
+          } >> "$GITHUB_OUTPUT"
+          cat "$report" >> "$GITHUB_STEP_SUMMARY"
+        fi
+        exit $code
